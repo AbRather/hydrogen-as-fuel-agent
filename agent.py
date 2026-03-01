@@ -1,107 +1,65 @@
 import os
-import pandas as pd
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent 
-from langchain_experimental.tools import PythonREPLTool
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langgraph.prebuilt import create_react_agent
 
 load_dotenv()
 
 # ==========================================
-# 1. DIGITAL TWIN SIMULATOR
+# TOOL 1: RAG PIPELINE
 # ==========================================
 @tool
-def digital_twin_stress_test(pressure_mpa: float, temp_k: float) -> str:
+def search_knowledge_base(query: str) -> str:
     """
-    Simulates structural integrity for Type IV Hydrogen Tanks using a 
-    physics-informed Digital Twin. Essential for predictive maintenance.
+    ALWAYS use this tool to search for documents, guidelines, manuals, PDFs, or CSVs.
+    Returns technical excerpts to ground the AI's response and prevent hallucinations.
     """
-    # 2026 Aerospace Standards: Safety Factor of 2.25 for CFRP
-    # Simplified Thin-Wall Pressure Vessel Stress: σ = (P * r) / t
-    radius = 0.5  # meters
-    thickness = 0.025  # meters (25mm Carbon Fiber)
-    
-    hoop_stress = (pressure_mpa * radius) / thickness
-    
-    # NASA/ESA 2026 Microcrack Resistance Threshold
-    limit_mpa = 650.0 
-    safety_margin = limit_mpa / hoop_stress if hoop_stress > 0 else 10.0
-    
-    status = "NOMINAL" if safety_margin >= 1.5 else "WARNING: MICROCRACK RISK"
-    if safety_margin < 1.0: status = "CRITICAL: STRUCTURAL FAILURE"
-
-    return (f"--- DIGITAL TWIN SIMULATION REPORT ---\n"
-            f"Input: {pressure_mpa}MPa @ {temp_k}K\n"
-            f"Calculated Hoop Stress: {hoop_stress:.2f} MPa\n"
-            f"Current Safety Factor: {safety_margin:.2f}\n"
-            f"Structural Status: {status}")
-
-# ==========================================
-# 2. EXPLAINABLE AI (XAI) SEARCH
-# ==========================================
-vectorstore = Chroma(
-    persist_directory="./chroma_db",
-    embedding_function=OpenAIEmbeddings(model="text-embedding-3-small")
-)
-
-@tool
-def search_technical_specs(query: str) -> str:
-    """
-    Queries the Engineering Knowledge Base. Returns excerpts with 
-    Full Metadata for regulatory compliance and auditability.
-    """
-    docs = vectorstore.similarity_search(query, k=2)
-    
-    # Returning structured metadata is key for 2026 XAI standards
-    excerpts = []
-    for doc in docs:
-        meta = doc.metadata
-        excerpts.append(
-            f"SOURCE: {meta.get('source', 'Unknown')}\n"
-            f"LOCATION: Page {meta.get('page', 'N/A')}\n"
-            f"CONTENT: {doc.page_content}\n"
+    try:
+        vectorstore = Chroma(
+            persist_directory="./chroma_db",
+            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small")
         )
-    return "\n---\n".join(excerpts)
+        docs = vectorstore.similarity_search(query, k=3)
+        if not docs:
+            return "No documents found. Ask the user to upload the reference file."
+        
+        excerpts = [f"[Page {d.metadata.get('page', 'N/A')}] {d.page_content}" for d in docs]
+        return "\n\n".join(excerpts)
+    except Exception as e:
+        return f"Database error: {str(e)}"
 
 # ==========================================
-# 3. ANOMALY DETECTION DATA TOOL
+# TOOL 2: CAPABILITY PROTOTYPE
 # ==========================================
-python_repl = PythonREPLTool()
-python_repl.description = (
-    "A Python shell for data analysis. "
-    "MANDATORY: You MUST use print() for ANY output you want to see (e.g., print(df.columns) or print(max_val)). "
-    "MANDATORY: You must always 'import pandas as pd' and 'df = pd.read_csv(\"data/renewable_hydrogen_dataset_2535.csv\")' in your script. "
-    "If production drops >20% or pressure exceeds 70MPa, flag it as an ANOMALY."
-)
+@tool
+def calculate_safety_margin(pressure_bar: float) -> str:
+    """
+    Calculates the safety margin for a standard pipeline.
+    Input must be a numeric pressure value in bar.
+    """
+    max_safe_pressure = 1000.0
+    margin = max_safe_pressure - pressure_bar
+    if margin < 0:
+        return f"CRITICAL WARNING: Pressure {pressure_bar} exceeds limits by {abs(margin)} bar."
+    return f"Status Nominal. Remaining pressure capacity: {margin} bar."
 
+# ==========================================
+# ORCHESTRATOR 
+# ==========================================
 def build_agent_executor():
-    tools = [python_repl, search_technical_specs, digital_twin_stress_test]
+    tools = [search_knowledge_base, calculate_safety_margin]
+    # Ensure your .env has OPENAI_API_KEY
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     
-    # Persona: EnBW System-Critical Infrastructure Lead
     system_instruction = (
-        "You are the Lead Operational AI for EnBW's Hydrogen Backbone. "
-        "1. Safety First: Use the digital_twin_stress_test for any pressure-related query. "
-        "2. Transparency: Always cite sources with Page Numbers and filenames. "
-        "3. Proactivity: If data analysis reveals a violation of specs, issue a CRITICAL ALARM."
+        "You are an Enterprise AI Architecture. "
+        "Your goal is to evaluate technical queries. "
+        "If asked about documents, use search_knowledge_base. "
+        "If asked about pressure or safety, use calculate_safety_margin. "
+        "Always be transparent about which tool you used."
     )
     
-    return create_agent(model=llm, tools=tools, system_prompt=system_instruction)
-
-if __name__ == "__main__":
-    agent_app = build_agent_executor()
-    
-    query = (
-        "We are evaluating a 75MPa operational load on a Type IV tank. "
-        "1. Use the Digital Twin to check the safety margin. "
-        "2. Search the specs to see if this pressure is allowed by ISO standards. "
-        "3. Find the maximum hydrogen production in the dataset and flag if it's an anomaly."
-    )
-    
-    response = agent_app.invoke({"messages": [("user", query)]})
-    print("\n" + "="*50 + "\nOPERATIONAL COMMAND CENTER REPORT\n" + "="*50)
-    print(response["messages"][-1].content)
+    return create_react_agent(llm, tools, prompt=system_instruction)

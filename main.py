@@ -1,72 +1,108 @@
-import uvicorn
-import json
-from fastapi import FastAPI
+import os
+import shutil
+import traceback
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_core.messages import AIMessage, ToolMessage
 
-# Import the brain we built in the other file
+from langchain_community.document_loaders import PyPDFLoader, CSVLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+
 from agent import build_agent_executor
 
-app = FastAPI(
-    title="Hydrogen Engineering Agent API",
-    description="Operational AI for Hydrogen Infrastructure with XAI Audit Trails.",
-    version="1.0.0"
+os.makedirs("./data", exist_ok=True)
+os.makedirs("./chroma_db", exist_ok=True)
+
+app = FastAPI(title="GenAI Architecture PoC", version="4.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 1. Define the input structure
 class QueryRequest(BaseModel):
     prompt: str
 
+class FeedbackRequest(BaseModel):
+    query: str
+    response: str
+    is_positive: bool
+
+# --- INGESTION PIPELINE ---
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    try:
+        file_path = f"./data/{file.filename}"
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        if file.filename.endswith(".pdf"):
+            loader = PyPDFLoader(file_path)
+        else:
+            raise HTTPException(status_code=400, detail="Please upload a PDF.")
+            
+        docs = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        splits = text_splitter.split_documents(docs)
+        
+        vectorstore = Chroma(
+            persist_directory="./chroma_db", 
+            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small")
+        )
+        vectorstore.add_documents(splits)
+        return {"status": "success", "message": f"Ingested {len(splits)} chunks."}
+    except Exception as e:
+        print("🚨 UPLOAD ERROR:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- AGENT ORCHESTRATION ---
 @app.post("/analyze")
 async def analyze_infrastructure(request: QueryRequest):
-    """
-    Primary endpoint for engineering queries. 
-    Returns the final report plus a detailed reasoning audit log.
-    """
-    # Initialize the agent
-    agent_app = build_agent_executor()
-    
-    # Run the agent through its thought process
-    # The 'messages' list will capture every thought and tool execution
-    response = agent_app.invoke({"messages": [("user", request.prompt)]})
-    
-    # 2. Build the Explainability Log (The Audit Trail)
-    # We loop through the internal message history to show the "Why"
-    reasoning_steps = []
-    for msg in response["messages"]:
-        # Capture when the AI decides to use a specific tool
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                reasoning_steps.append({
-                    "step": len(reasoning_steps) + 1,
-                    "event": "AI_DECISION",
-                    "action": f"Executing Tool: {tool_call['name']}",
-                    "logic_input": tool_call['args']
-                })
+    try:
+        agent_app = build_agent_executor()
+        response = agent_app.invoke({"messages": [("user", request.prompt)]})
         
-        # Capture what the tool actually returned to the AI
-        elif isinstance(msg, ToolMessage):
-            reasoning_steps.append({
-                "step": len(reasoning_steps) + 1,
-                "event": "TOOL_OBSERVATION",
-                "output_data": msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
-            })
+        reasoning_steps = []
+        for msg in response["messages"]:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tool_call in msg.tool_calls:
+                    reasoning_steps.append({
+                        "step": len(reasoning_steps) + 1,
+                        "event": f"Triggered: {tool_call['name']}"
+                    })
 
-    # 3. Construct the structured response
-    # We use a JSONResponse to ensure it is sent back as clean, ordered JSON
-    content = {
-        "status": "success",
-        "query_received": request.prompt,
-        "final_report": response["messages"][-1].content,
-        "explainability_log": reasoning_steps
+        content = {
+            "status": "success",
+            "final_report": response["messages"][-1].content,
+            "explainability_log": reasoning_steps
+        }
+        return JSONResponse(content=content)
+    except Exception as e:
+        print("\n" + "!"*50)
+        print("🚨 CRITICAL BACKEND ERROR 🚨")
+        traceback.print_exc()
+        print("!"*50 + "\n")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- EVALUATION & TELEMETRY ---
+@app.post("/feedback")
+async def log_feedback(request: FeedbackRequest):
+    log_entry = {
+        "query": request.query,
+        "is_positive": request.is_positive,
+        "status": "Logged to Evaluation DB"
     }
-    
-    return JSONResponse(
-        content=content, 
-        media_type="application/json"
-    )
+    print(f"TELEMETRY LOGGED: {log_entry}")
+    return {"status": "success", "message": "Feedback recorded for model evaluation."}
 
 if __name__ == "__main__":
-    # Run the server on port 8000
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
